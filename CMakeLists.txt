@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.5)
 
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
+
 # Set extension name here
-set(TARGET_NAME quack)
+set(TARGET_NAME fast_lanes)
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
@@ -14,7 +19,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/quack_extension.cpp)
+set(EXTENSION_SOURCES src/fast_lanes_extension.cpp src/read_fast_lanes.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -22,6 +27,37 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+
+#-----------------------------------------------------------------------------------------------------------------------
+# FLS :
+include(FetchContent)
+include(CMakePrintHelpers)
+#
+option(FLS_EXTENSION_BUILD_EXAMPLES "Build Examples Option" OFF)
+## TODO: enable
+option(FLS_ENABLE_CLANG_TIDY "Enable clang_tidy on all targets" OFF)
+#
+#
+## Definitions: ---------------------------------------------------------------------------------------------------------
+add_compile_definitions(FLS_EXTENSION_CMAKE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+
+# FastLanes: -----------------------------------------------------------------------------------------------------------
+message("---------------------------------------------------------------------------------------------------------")
+message("-- FLS Extension: Build FastLanes ")
+
+FetchContent_Declare(
+        fls_repo
+        GIT_REPOSITORY https://github.com/cwida/FastLanes.git
+        GIT_TAG release_v0.1
+)
+
+FetchContent_MakeAvailable(fls_repo)
+include_directories(${fls_repo_SOURCE_DIR}/include)
+
+target_link_libraries(${EXTENSION_NAME} FastLanes)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} FastLanes)
+
+#-----------------------------------------------------------------------------------------------------------------------
 
 install(
   TARGETS ${EXTENSION_NAME}
