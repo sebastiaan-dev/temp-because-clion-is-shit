@@ -2,6 +2,8 @@
 
 #include <duckdb/main/extension_util.hpp>
 #include <fls/connection.hpp>
+#include <fls/encoder/materializer.hpp>
+#include <sys/param.h>
 
 namespace duckdb {
 
@@ -57,24 +59,42 @@ static LogicalType TranslateType(fastlanes::DataType type) {
 //-------------------------------------------------------------------
 // Transformations
 //-------------------------------------------------------------------
-static void TransformSimpleType(fastlanes::col_pt &column, Vector &output, uint64_t offset) {
+// TODO: Maybe return new vector?
+static void TransformSimpleType(fastlanes::col_pt &source_col, Vector &output, uint64_t offset) {
 	std::visit(fastlanes::overloaded {[&](const fastlanes::up<fastlanes::TypedCol<double>> &typed_col) {
-		                                  for (idx_t i = 0; i < 1024; ++i) {
-			                                  output.SetValue(i, Value {typed_col->data[offset + i]});
-		                                  }
+		double *data_ptr = FlatVector::GetData<double>(output);
+		*data_ptr = *reinterpret_cast<double *>(&typed_col->data[offset]);
+
+		                                  memcpy(FlatVector::GetData<double>(output), &typed_col->data[offset],
+		                                         sizeof(double) * 1024);
+		// ---- ALTERNATIVE OPTION
+		                                  // for (idx_t i = 0; i < 1024; ++i) {
+		                                  // 	FlatVector::GetData<double>(output)[i] = typed_col->data[offset + i];
+		                                  // }
+		// ---- ALTERNATIVE OPTION
+		                                  output.Reference(
+		                                      Vector {LogicalType::DOUBLE,
+		                                      reinterpret_cast<data_ptr_t>(&typed_col->data[offset])});
+		// ---- ALTERNATIVE OPTION
+		                                  // for (idx_t i = 0; i < 1024; ++i) {
+		                                  //  output.SetValue(i, Value {typed_col->data[offset + i]});
+		                                  // }
 	                                  },
 	                                  [&](const auto &) {
-		                                  // TODO
+	                                  	throw InternalException("TransformSimpleType: column type is not supported");
 	                                  }},
-	           column);
+	           source_col);
 }
 
-static void TransformType(fastlanes::col_pt &column, Vector &output, uint64_t offset) {
+static void TransformType(fastlanes::col_pt &source_col, Vector &output, uint64_t offset) {
 	std::visit(fastlanes::overloaded {[](const std::monostate &) {
 		                                  // TODO
 	                                  },
 	                                  [&]<typename T>(const fastlanes::up<fastlanes::TypedCol<T>> &typed_col) {
-		                                  TransformSimpleType(column, output, offset);
+	                                  	// TODO: dynamic size
+	                                  	// TODO: This should instead write to FlatVector::GetData<T>(output) directly instead of requiring a copy.
+	                                  	memcpy(FlatVector::GetData<T>(output), &typed_col->data[offset],
+												 sizeof(T) * 1024);
 	                                  },
 	                                  [&](const fastlanes::up<fastlanes::List> &list_col) {
 		                                  // TODO
@@ -83,9 +103,9 @@ static void TransformType(fastlanes::col_pt &column, Vector &output, uint64_t of
 		                                  // TODO
 	                                  },
 	                                  [&](const auto &) {
-		                                  // TODO
+	                                  	throw InternalException("TransformType: column type is not supported");
 	                                  }},
-	           column);
+	           source_col);
 }
 
 //-------------------------------------------------------------------
@@ -97,9 +117,9 @@ static unique_ptr<LocalTableFunctionState> LocalInitFn(ExecutionContext &context
 	auto &bind_data = input.bind_data->Cast<FastLanesReadBindData>();
 
 	local_state->conn = fastlanes::Connection {};
-
-	fastlanes::Reader &reader = local_state->conn.read_fls(bind_data.directory);
-	local_state->row_group = reader.materialize();
+	local_state->reader = std::make_unique<fastlanes::Reader>(bind_data.directory, local_state->conn);
+	local_state->row_group = std::make_unique<fastlanes::Rowgroup>(local_state->reader->footer());
+	local_state->materializer = std::make_unique<fastlanes::Materializer>(*local_state->row_group);
 
 	return local_state;
 };
@@ -111,6 +131,14 @@ static unique_ptr<GlobalTableFunctionState> GlobalInitFn(ClientContext &context,
 	auto global_state = make_uniq<FastLanesReadGlobalState>();
 	auto &bind_data = input.bind_data->Cast<FastLanesReadBindData>();
 
+	// Verify that a Fastlanes vector fits in the output Vector of DuckDB
+	// TODO: DuckDB 2048
+	D_ASSERT(fastlanes::CFG::VEC_SZ <= 1024);
+	// Vector size should be a power of 2 to allow shift based multiplication.
+	D_ASSERT(powerof2(fastlanes::CFG::VEC_SZ));
+
+	global_state->vec_sz = fastlanes::CFG::VEC_SZ;
+	global_state->vec_sz_exp = std::log2(global_state->vec_sz);
 	global_state->n_vector = bind_data.n_vector;
 	global_state->cur_vector = 0;
 
@@ -150,23 +178,31 @@ static void TableFn(ClientContext &context, TableFunctionInput &data, DataChunk 
 	const auto &local_state = data.local_state->Cast<FastLanesReadLocalState>();
 
 	if (global_state.cur_vector < global_state.n_vector) {
-		// Buffer is full, call table function again for next batch of data.
-		output.SetCardinality(1024);
-		++global_state.cur_vector;
+		// Per vector processing
+		output.SetCardinality(global_state.vec_sz);
+		// output.SetCapacity(global_state.vec_sz);
 	} else {
-		// This stops the stream of data, table function is no longer called.
+		// Stop the stream of data, table function is no longer called.
 		output.SetCardinality(0);
 		return;
 	}
 
+	// Every time we call get_chunk we incrementally fill the internal_rowgroup, we use an offset to start at the newly
+	// filled entries.
+	auto &expressions = local_state.reader->get_chunk(global_state.cur_vector);
+	local_state.materializer->Materialize(expressions, global_state.cur_vector);
+
 	// ColumnCount is defined during the bind of the table function.
 	for (idx_t col_idx = 0; col_idx < output.ColumnCount(); col_idx++) {
 		auto &target_col = output.data[col_idx];
-		auto &col = local_state.row_group->internal_rowgroup[col_idx];
+		// auto &source_col = local_state.row_group->internal_rowgroup[col_idx];
 
-		TransformType(col, target_col, global_state.cur_vector * 1024);
+		local_state.materializer->MaterializeV2(expressions, global_state.cur_vector, FlatVector::GetData(target_col));
+		// TransformType(source_col, target_col, global_state.cur_vector << global_state.vec_sz_exp);
 	}
 
+	// Go to the next vector in the row group
+	++global_state.cur_vector;
 	output.Verify();
 }
 
